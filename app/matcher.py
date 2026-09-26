@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Any
 
 from .config import Settings
@@ -101,23 +102,133 @@ class TokenScore:
     candidate_only: list[str] = field(default_factory=list)
 
 
-def _pair_tokens(q_tokens: list[str], c_scored: list[str]):
-    matched: list[dict[str, Any]] = []
-    used: set[str] = set()
-    for qt in q_tokens:
-        best: tuple[str, float] | None = None
-        for ct in c_scored:
-            if ct in used:
+# Tolerance for comparing similarity sums: sums closer than this are ties,
+# resolved by the stable canonical order rather than by float noise.
+_SIM_EPS = 1e-9
+
+
+def _assign_component(a_toks: list[str], b_toks: list[str],
+                      adj: dict[str, list[tuple[str, float]]],
+                      flipped: bool) -> list[tuple[str, str]]:
+    """Optimal one-to-one assignment inside one connected component.
+
+    ``a_toks`` is the side being walked (in canonical token-string order)
+    while ``b_toks`` is the DP bitmask side. Among all assignments that
+    maximise first the pair count and then the summed similarity, the walk
+    takes the lexicographically smallest pair list in walked-side order --
+    a stable tie-break that depends only on the tokens, never on input order.
+    """
+    b_index = {t: j for j, t in enumerate(b_toks)}
+    edges: list[list[tuple[int, float]]] = [
+        [(b_index[b], ratio) for b, ratio in adj[a]] for a in a_toks
+    ]
+
+    @lru_cache(maxsize=None)
+    def best_from(i: int, mask: int) -> tuple[int, float]:
+        """Best (pair_count, similarity_sum) for a_toks[i:] given ``mask``."""
+        if i == len(a_toks):
+            return (0, 0.0)
+        best_count, best_sim = best_from(i + 1, mask)  # a_toks[i] unmatched
+        for j, ratio in edges[i]:
+            bit = 1 << j
+            if mask & bit:
                 continue
+            count, sim = best_from(i + 1, mask | bit)
+            count += 1
+            sim += ratio
+            if count > best_count or (
+                count == best_count and sim > best_sim + _SIM_EPS
+            ):
+                best_count, best_sim = count, sim
+        return (best_count, best_sim)
+
+    pairs: list[tuple[str, str]] = []
+    mask = 0
+    for i, a in enumerate(a_toks):
+        target_count, target_sim = best_from(i, mask)
+        for j, ratio in edges[i]:
+            bit = 1 << j
+            if mask & bit:
+                continue
+            count, sim = best_from(i + 1, mask | bit)
+            if (count + 1 == target_count
+                    and sim + ratio >= target_sim - _SIM_EPS):
+                pairs.append((b_toks[j], a) if flipped else (a, b_toks[j]))
+                mask |= bit
+                break
+    return pairs
+
+
+def _pair_tokens(q_tokens: list[str], c_scored: list[str]):
+    """One-to-one optimal assignment between query and candidate tokens.
+
+    A greedy query-order walk can strand legal fuzzy pairs (query
+    ``aaa, aaba`` vs candidate ``aaa, aaab`` would match only one pair,
+    although two legal pairs exist). Instead the assignment is solved
+    globally within the component: maximise the number of pairs first, then
+    the summed similarity. Ties are broken by a stable canonical order that
+    depends only on the token strings, so permuting the tokens on either
+    side changes neither the score nor the match details.
+    """
+    if not q_tokens or not c_scored:
+        return [], set()
+
+    # Legal fuzzy edges; the relation is symmetric, so one adjacency pair
+    # serves both orientations.
+    q_adj: dict[str, list[tuple[str, float]]] = {t: [] for t in q_tokens}
+    c_adj: dict[str, list[tuple[str, float]]] = {t: [] for t in c_scored}
+    ratios: dict[tuple[str, str], float] = {}
+    for qt in q_tokens:
+        for ct in c_scored:
             ok, ratio = _fuzzy_equal(qt, ct)
-            if ok and (best is None or ratio > best[1]):
-                best = (ct, ratio)
-        if best is not None:
-            ct, ratio = best
-            used.add(ct)
-            matched.append({"query": qt, "candidate": ct,
-                            "similarity": round(ratio, 3)})
-    return matched, used
+            if ok:
+                q_adj[qt].append((ct, ratio))
+                c_adj[ct].append((qt, ratio))
+                ratios[(qt, ct)] = ratio
+    for neighbours in list(q_adj.values()) + list(c_adj.values()):
+        neighbours.sort()
+
+    # The assignment decomposes over the connected components of the edge
+    # graph, so the exact search stays tiny even for long token lists (CJK
+    # tokens, for instance, only ever form exact-match edges).
+    pairs: list[tuple[str, str]] = []
+    seen_q: set[str] = set()
+    seen_c: set[str] = set()
+    for seed in sorted(q_adj):
+        if seed in seen_q or not q_adj[seed]:
+            continue
+        comp_q: list[str] = []
+        comp_c: list[str] = []
+        seen_q.add(seed)
+        stack = [("q", seed)]
+        while stack:
+            side, token = stack.pop()
+            if side == "q":
+                comp_q.append(token)
+                for nbr, _ in q_adj[token]:
+                    if nbr not in seen_c:
+                        seen_c.add(nbr)
+                        stack.append(("c", nbr))
+            else:
+                comp_c.append(token)
+                for nbr, _ in c_adj[token]:
+                    if nbr not in seen_q:
+                        seen_q.add(nbr)
+                        stack.append(("q", nbr))
+        comp_q.sort()
+        comp_c.sort()
+        # Walk the larger side, bitmask over the smaller one.
+        if len(comp_q) >= len(comp_c):
+            pairs.extend(_assign_component(comp_q, comp_c, q_adj, flipped=False))
+        else:
+            pairs.extend(_assign_component(comp_c, comp_q, c_adj, flipped=True))
+
+    pairs.sort()
+    matched = [
+        {"query": q, "candidate": c, "similarity": round(ratios[(q, c)], 3)}
+        for q, c in pairs
+    ]
+    return matched, {c for _, c in pairs}
 
 
 def _score_component(query: list[str], candidate: list[str]) -> TokenScore:
@@ -133,7 +244,7 @@ def _score_component(query: list[str], candidate: list[str]) -> TokenScore:
     c_available = set(c_scored) - used
 
     matched_q = {m["query"] for m in matched}
-    query_only = [t for t in q_tokens if t not in matched_q]
+    query_only = sorted(t for t in q_tokens if t not in matched_q)
     candidate_only = sorted(c_available)
 
     precision = len(matched) / len(q_tokens) if q_tokens else 0.0
