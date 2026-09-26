@@ -4,7 +4,11 @@ The address is scored along two independent axes:
 
 * **tokens**  - street name / city / suffix words (after normalisation),
   scored with a set-based precision/recall (F1). Pairs that only match
-  fuzzily use a Levenshtein ratio above 0.72;
+  fuzzily use a Levenshtein ratio above 0.72. Within each component the
+  query/candidate token pairs are chosen by a one-to-one global
+  assignment (maximum pairs first, then maximum total similarity) rather
+  than a query-ordered greedy pass, so token permutation never changes
+  the score or the pairing detail;
 * **house number** - scored separately so that ``100 Main St`` and
   ``1000 Main St`` are never confused despite near-identical street text.
 
@@ -101,28 +105,118 @@ class TokenScore:
     candidate_only: list[str] = field(default_factory=list)
 
 
-def _pair_tokens(q_tokens: list[str], c_scored: list[str]):
-    matched: list[dict[str, Any]] = []
-    used: set[str] = set()
+def _optimal_assignment(q_tokens: list[str], c_tokens: list[str]
+                        ) -> list[tuple[int, int, float]]:
+    """One-to-one maximum-weight assignment between the two token lists.
+
+    The objective is lexicographic: first maximise the number of legal
+    fuzzy pairs, then the sum of their similarities. Tie-breaking uses the
+    stable (canonical) input ordering, so permuting the tokens does not
+    change the result. Implemented with the Hungarian algorithm on a
+    square cost matrix: every assigned pair is worth ``BONUS + similarity``,
+    where ``BONUS`` dominates every possible similarity gain; dummy
+    (unmatched) rows/columns cost 0 and forbidden edges cost strictly
+    more than leaving both endpoints unmatched.
+    """
+    n, m = len(q_tokens), len(c_tokens)
+    if not n or not m:
+        return []
+
+    sim: list[list[float | None]] = []
     for qt in q_tokens:
-        best: tuple[str, float] | None = None
-        for ct in c_scored:
-            if ct in used:
-                continue
+        row: list[float | None] = []
+        for ct in c_tokens:
             ok, ratio = _fuzzy_equal(qt, ct)
-            if ok and (best is None or ratio > best[1]):
-                best = (ct, ratio)
-        if best is not None:
-            ct, ratio = best
-            used.add(ct)
-            matched.append({"query": qt, "candidate": ct,
-                            "similarity": round(ratio, 3)})
+            row.append(ratio if ok else None)
+        sim.append(row)
+
+    k = max(n, m)
+    # An edge's gain is BONUS + similarity, so one extra pair outweighs any
+    # possible improvement in similarity alone (similarity <= 1).
+    bonus = float(k + 1)
+    forbidden = 2.0 * bonus
+    # Minimisation costs on the padded k x k matrix.
+    cost = [[0.0] * k for _ in range(k)]
+    for i in range(k):
+        for j in range(k):
+            if i < n and j < m:
+                ratio = sim[i][j]
+                cost[i][j] = -(bonus + ratio) if ratio is not None else forbidden
+
+    # Standard O(k^3) Hungarian algorithm for square matrices (1-indexed
+    # potentials/arrays). The "<" comparisons keep the result deterministic
+    # and, with canonical input order, pick the stable tie-break.
+    inf = float("inf")
+    u = [0.0] * (k + 1)
+    v = [0.0] * (k + 1)
+    p = [0] * (k + 1)        # p[j] = row assigned to column j
+    way = [0] * (k + 1)
+    for i in range(1, k + 1):
+        p[0] = i
+        j0 = 0
+        minv = [inf] * (k + 1)
+        used_col = [False] * (k + 1)
+        while True:
+            used_col[j0] = True
+            i0 = p[j0]
+            delta = inf
+            j1 = 0
+            for j in range(1, k + 1):
+                if not used_col[j]:
+                    cur = cost[i0 - 1][j - 1] - u[i0] - v[j]
+                    if cur < minv[j]:
+                        minv[j] = cur
+                        way[j] = j0
+                    if minv[j] < delta:
+                        delta = minv[j]
+                        j1 = j
+            for j in range(k + 1):
+                if used_col[j]:
+                    u[p[j]] += delta
+                    v[j] -= delta
+                else:
+                    minv[j] -= delta
+            j0 = j1
+            if p[j0] == 0:
+                break
+        while True:
+            j1 = way[j0]
+            p[j0] = p[j1]
+            j0 = j1
+            if j0 == 0:
+                break
+
+    pairs: list[tuple[int, int, float]] = []
+    for j in range(1, k + 1):
+        i = p[j] - 1
+        if 0 <= i < n and j - 1 < m and sim[i][j - 1] is not None:
+            pairs.append((i, j - 1, sim[i][j - 1]))  # type: ignore[arg-type]
+    return pairs
+
+
+def _pair_tokens(q_tokens: list[str], c_scored: list[str]):
+    """Global one-to-one pairing within one address component.
+
+    Returns the stable list of matched pairs and the set of consumed
+    candidate tokens. Inputs are expected in canonical (sorted) order so
+    the assignment is independent of the original token arrangement.
+    """
+    pairs = _optimal_assignment(q_tokens, c_scored)
+    pairs.sort(key=lambda ic: ic[0])
+    matched: list[dict[str, Any]] = [
+        {"query": q_tokens[i], "candidate": c_scored[j],
+         "similarity": round(ratio, 3)}
+        for i, j, ratio in pairs
+    ]
+    used = {c_scored[j] for _, j, _ in pairs}
     return matched, used
 
 
 def _score_component(query: list[str], candidate: list[str]) -> TokenScore:
-    q_tokens = list(dict.fromkeys(query))
-    c_tokens = list(dict.fromkeys(candidate))
+    # Canonical (sorted) de-duplicated order: pairing and every detail list
+    # must be independent of how tokens were arranged in the input.
+    q_tokens = sorted(set(query))
+    c_tokens = sorted(set(candidate))
 
     # Candidate-only metadata (postcode, country) must not penalise recall
     # when the query omits it; metadata present in the query is still scored.
